@@ -1,24 +1,43 @@
 #!/usr/bin/env bash
-# start_browser.sh — launch Chrome with a persistent profile and CDP on port 9222
-#
-# Environment variables you can override:
-#   CHROME        path to browser executable (auto-detected if not set)
-#   CHROME_ARGS   extra flags appended to launch (e.g. --window-size=1920,1080 --lang=en)
-#   HEADLESS      set to any value to add --headless=new
-#   CDP_PORT      remote-debugging-port (default 9222)
-#   PROFILE_DIR   --user-data-dir (default: ./user_profile)
-
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
-export PROJECT_ROOT
+PROFILE_DIR="${1:?Usage: $0 <profile_dir> [headless] [cdp_port] [chrome_path]}"
+HEADLESS="${2:-false}"
+CDP_PORT="${3:-9222}"
+CHROME="${4:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 
-# shellcheck source=lib/common.sh
-source "${PROJECT_ROOT}/lib/common.sh"
-# shellcheck source=lib/browser.sh
-source "${PROJECT_ROOT}/lib/browser.sh"
+if [ ! -f "$CHROME" ]; then
+  echo "[ERROR] Chrome not found at: $CHROME"
+  exit 1
+fi
 
-start_browser \
-  "${PROFILE_DIR:-${PROJECT_ROOT}/user_profile}" \
-  "${CDP_PORT:-9222}" \
-  "${CHROME_ARGS:-}"
+HEADLESS_FLAG=""
+if [ "$HEADLESS" != "false" ] && [ -n "$HEADLESS" ]; then
+  HEADLESS_FLAG="--headless=new"
+fi
+
+echo "Profile:   $PROFILE_DIR"
+echo "CDP port:  $CDP_PORT"
+echo "Headless:  $HEADLESS"
+echo "Chrome:    $CHROME"
+
+"$CHROME" \
+  --remote-debugging-port="$CDP_PORT" \
+  --user-data-dir="$PROFILE_DIR" \
+  --no-first-run \
+  --no-default-browser-check \
+  --disable-background-networking \
+  --disable-sync \
+  $HEADLESS_FLAG \
+  > /dev/null 2>&1 &
+
+for i in $(seq 1 15); do
+  if curl -s "http://localhost:${CDP_PORT}/json/version" > /dev/null 2>&1; then
+    echo "[OK] CDP ready at http://localhost:${CDP_PORT}"
+    exit 0
+  fi
+  sleep 1
+done
+
+echo "[WARN] CDP not responding after 15s"
+exit 1
