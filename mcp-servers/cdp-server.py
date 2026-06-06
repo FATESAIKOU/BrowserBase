@@ -332,6 +332,131 @@ async def _select(target: str, value: str | None = None, label: str | None = Non
     return await _evaluate(code)
 
 
+# ── Coordinate-based Click (#1) ───────────────────────────────────────────────
+
+
+async def _click_xy(
+    x: float,
+    y: float,
+    button: str = "left",
+    click_count: int = 1,
+    delay_ms: int = 50,
+) -> str:
+    """Click at absolute viewport coordinates (CSS pixels).
+
+    Generates real mouse events via Input.dispatchMouseEvent, including
+    move + pressed + released. This is more reliable than elementFromPoint().click()
+    for SPAs that listen to native mouse events (e.g. Gmail, Google Docs).
+
+    Args:
+        x, y: CSS pixel coordinates inside the viewport.
+        button: 'left' | 'right' | 'middle'.
+        click_count: 1 for single click, 2 for double click.
+        delay_ms: Delay between pressed and released events.
+    """
+    try:
+        await _cdp_call("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": x, "y": y, "button": "none"
+        })
+        await _cdp_call("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": x, "y": y,
+            "button": button, "clickCount": click_count
+        })
+        if delay_ms > 0:
+            await asyncio.sleep(delay_ms / 1000)
+        await _cdp_call("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": x, "y": y,
+            "button": button, "clickCount": click_count
+        })
+    except Exception as e:
+        return f"[ERROR] click_xy failed: {e}"
+    return f"clicked at ({x}, {y}) button={button} count={click_count}"
+
+
+# ── Smart Wait (#2) ──────────────────────────────────────────────────────────
+
+
+async def _wait_for(
+    selector: str | None = None,
+    text: str | None = None,
+    state: str = "visible",
+    timeout_ms: int = 5000,
+    poll_ms: int = 200,
+) -> str:
+    """Wait for an element to appear or reach a desired state.
+
+    Args:
+        selector: CSS selector to wait for.
+        text: Visible text to wait for (substring match).
+        state: 'visible' (default), 'hidden', 'attached' (in DOM), or 'gone'.
+        timeout_ms: Max wait time.
+        poll_ms: Polling interval.
+
+    Returns: 'found' / 'state reached' or '[TIMEOUT] elapsed=...'
+    """
+    if not selector and not text:
+        return "[ERROR] Must provide selector or text"
+    state = state.lower()
+    if state not in ("visible", "hidden", "attached", "gone"):
+        return f"[ERROR] Unknown state: {state}"
+
+    deadline = time.time() + timeout_ms / 1000
+    last_err = ""
+
+    while time.time() < deadline:
+        try:
+            check_js = """
+            (() => {
+                let el = null;
+                if (SEL) {
+                    el = document.querySelector(SEL);
+                } else if (TXT) {
+                    const t = TXT;
+                    const all = document.querySelectorAll('*');
+                    for (const n of all) {
+                        if (n.children.length === 0 && (n.textContent || '').includes(t)) {
+                            el = n; break;
+                        }
+                    }
+                }
+                if (!el) return 'absent';
+                const r = el.getBoundingClientRect();
+                const cs = getComputedStyle(el);
+                const visible = r.width > 0 && r.height > 0
+                    && cs.visibility !== 'hidden' && cs.display !== 'none'
+                    && parseFloat(cs.opacity || '1') > 0;
+                return JSON.stringify({found: true, visible, attached: true,
+                    rect: {x: r.x, y: r.y, w: r.width, h: r.height}});
+            })()
+            """.replace("SEL", json.dumps(selector) if selector else "''") \
+               .replace("TXT", json.dumps(text) if text else "''")
+
+            result_str = await _evaluate(check_js)
+            try:
+                info = json.loads(result_str)
+            except Exception:
+                info = {"found": False, "visible": False}
+
+            is_absent = info.get("found") is None or (isinstance(info.get("found"), bool) and not info["found"]) or result_str == "absent"
+            is_visible = info.get("visible") is True
+
+            if state == "visible" and is_visible:
+                rect = info.get("rect", {})
+                return f"visible at ({rect.get('x', '?')}, {rect.get('y', '?')}) size={rect.get('w', '?')}x{rect.get('h', '?')}"
+            if state == "attached" and not is_absent:
+                return "attached"
+            if state in ("hidden", "gone") and is_absent:
+                return "absent"
+            if state in ("hidden", "gone") and not is_visible:
+                return "hidden"
+        except Exception as e:
+            last_err = str(e)
+
+        await asyncio.sleep(poll_ms / 1000)
+
+    return f"[TIMEOUT] after {timeout_ms}ms waiting for {state} (selector={selector}, text={text}). Last: {last_err}"
+
+
 async def _scroll(to: str | None = None, pixels: int | None = None, selector: str | None = None) -> str:
     if selector:
         code = f"document.querySelector({json.dumps(selector)})?.scrollIntoView({{block: 'center'}}); 'scrolled to: {selector}'"
@@ -395,6 +520,175 @@ async def _screenshot(selector: str | None = None, quality: int = 80) -> str:
         f"URL: {url}\n"
         f"(Use the Read tool to view the image at the path above)"
     )
+
+
+# ── Annotated Screenshot (#10) ────────────────────────────────────────────────
+
+
+async def _screenshot_annotated(
+    max_elements: int = 80,
+    min_size: int = 8,
+    quality: int = 80,
+) -> str:
+    """Take a screenshot with interactive elements annotated.
+
+    Each clickable element gets:
+      - a colored bounding box
+      - a numbered label
+      - a small tag with its text / role / type
+
+    Returns the image path plus a JSON manifest of all annotated elements
+    so the caller can map "element #5" to its actual DOM node.
+
+    Args:
+        max_elements: Cap to avoid overwhelming the image.
+        min_size: Skip boxes smaller than this (px) to reduce noise.
+        quality: JPEG quality (1-100, 100+ for PNG).
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return "[ERROR] PIL (Pillow) is required. Install with: pip install Pillow"
+
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    quality = min(max(quality, 1), 100)
+    fmt_param = "png" if quality >= 100 else "jpeg"
+
+    elements_js = """
+    (() => {
+        const SEL = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="menuitem"], [role="tab"], [onclick]';
+        const nodes = document.querySelectorAll(SEL);
+        const results = [];
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        let idx = 0;
+        for (const el of nodes) {
+            const r = el.getBoundingClientRect();
+            if (r.width < MIN || r.height < MIN) continue;
+            if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) continue;
+            const cs = getComputedStyle(el);
+            if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+            if (parseFloat(cs.opacity || '1') <= 0) continue;
+            const tag = el.tagName.toLowerCase();
+            const type = el.type || '';
+            const text = (el.innerText || el.value || el.placeholder || el.title || el.getAttribute('aria-label') || '').trim().substring(0, 60);
+            const role = el.getAttribute('role') || '';
+            const href = (el.getAttribute && el.getAttribute('href')) || '';
+            const sel = (() => {
+                if (el.id) return '#' + el.id;
+                if (el.name) return tag + '[name="' + el.name + '"]';
+                if (el.className && typeof el.className === 'string') {
+                    const c = el.className.trim().split(/\\s+/).slice(0, 2).join('.');
+                    if (c) return tag + '.' + c;
+                }
+                return tag;
+            })();
+            results.push({
+                i: idx++,
+                tag, type, text, role, href, sel,
+                x: r.x, y: r.y, w: r.width, h: r.height
+            });
+            if (idx >= MAX) break;
+        }
+        return JSON.stringify({viewport: {w: vw, h: vh}, elements: results});
+    })()
+    """.replace("MAX", str(max_elements)).replace("MIN", str(min_size))
+
+    manifest_str = await _evaluate(elements_js)
+    try:
+        manifest = json.loads(manifest_str)
+    except Exception as e:
+        return f"[ERROR] Failed to parse element manifest: {e}\nRaw: {manifest_str[:500]}"
+
+    viewport = manifest.get("viewport", {})
+    elements = manifest.get("elements", [])
+
+    # Capture the screenshot
+    params = {"format": fmt_param, "quality": quality, "captureBeyondViewport": True}
+    result = await _cdp_call("Page.captureScreenshot", params)
+    if "error" in result or "data" not in result:
+        return f"[ERROR] Screenshot failed: {result.get('error', 'no data')}"
+
+    img_bytes = base64.b64decode(result["data"])
+
+    timestamp = int(time.time() * 1000)
+    raw_path = os.path.join(SCREENSHOT_DIR, f"screenshot_{timestamp}.{fmt_param}")
+    with open(raw_path, "wb") as f:
+        f.write(img_bytes)
+
+    # Annotate
+    img = Image.open(raw_path).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # Try to load a font
+    font = None
+    label_font = None
+    for path in [
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]:
+        if os.path.exists(path):
+            try:
+                font = ImageFont.truetype(path, 14)
+                label_font = ImageFont.truetype(path, 11)
+                break
+            except Exception:
+                pass
+    if font is None:
+        font = ImageFont.load_default()
+        label_font = font
+
+    color_palette = [
+        (255, 0, 0, 220),    # red
+        (0, 128, 255, 220),  # blue
+        (0, 200, 0, 220),    # green
+        (255, 128, 0, 220),  # orange
+        (180, 0, 255, 220),  # purple
+        (0, 200, 200, 220),  # teal
+    ]
+
+    for el in elements:
+        color = color_palette[el["i"] % len(color_palette)]
+        x, y, w, h = el["x"], el["y"], el["w"], el["h"]
+        # Draw rectangle
+        draw.rectangle([x, y, x + w, y + h], outline=color, width=2)
+        # Numbered label background
+        label_text = f"#{el['i']}"
+        try:
+            tb = draw.textbbox((0, 0), label_text, font=font)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        except AttributeError:
+            tw, th = 20, 16
+        label_x = x
+        label_y = max(0, y - th - 4)
+        draw.rectangle([label_x, label_y, label_x + tw + 6, label_y + th + 4], fill=color)
+        draw.text((label_x + 3, label_y + 2), label_text, fill=(255, 255, 255, 255), font=font)
+
+    img = Image.alpha_composite(img, overlay)
+    annotated_path = os.path.join(SCREENSHOT_DIR, f"annotated_{timestamp}.png")
+    img.convert("RGB").save(annotated_path, "PNG", optimize=True)
+
+    # Write manifest JSON next to image
+    manifest_path = os.path.join(SCREENSHOT_DIR, f"annotated_{timestamp}.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    size_kb = os.path.getsize(annotated_path) / 1024
+    url = await _evaluate("window.location.href")
+    summary_lines = [
+        f"Annotated screenshot saved.",
+        f"Image: {annotated_path} ({size_kb:.1f} KB)",
+        f"Manifest: {manifest_path}",
+        f"Elements annotated: {len(elements)} / viewport: {viewport.get('w')}x{viewport.get('h')}",
+        f"URL: {url}",
+        f"",
+        f"Manifest format: array of {{i, tag, type, text, role, sel, x, y, w, h}}",
+        f"Use 'sel' to target an element (e.g. document.querySelector('<sel>'))",
+        f"Use cdp_click_xy(x + w/2, y + h/2) to click an element by its number.",
+    ]
+    return "\n".join(summary_lines)
 
 
 # ── Profile & Session ─────────────────────────────────────────────────────────
@@ -728,6 +1022,47 @@ TOOLS = [
             },
         },
     ),
+    Tool(
+        name="cdp_screenshot_annotated",
+        description="Take a screenshot with every interactive element (links, buttons, inputs, etc.) outlined in colored boxes and labeled with a number. Also writes a JSON manifest mapping each #N to its DOM info (tag, text, role, selector, x/y/w/h). Use this to decide where to click visually, then call cdp_click_xy(x + w/2, y + h/2).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "max_elements": {"type": "integer", "description": "Cap on number of elements to annotate (default 80)", "default": 80},
+                "min_size": {"type": "integer", "description": "Skip boxes smaller than this many pixels (default 8)", "default": 8},
+                "quality": {"type": "integer", "description": "JPEG quality 1-100, 100+ for PNG (default 80)", "default": 80},
+            },
+        },
+    ),
+    Tool(
+        name="cdp_click_xy",
+        description="Click at viewport coordinates (CSS pixels) using real mouse events (Input.dispatchMouseEvent). More reliable than elementFromPoint().click() for SPAs that listen to native mouse events.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "x": {"type": "number", "description": "X coordinate in CSS pixels"},
+                "y": {"type": "number", "description": "Y coordinate in CSS pixels"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button (default: left)", "default": "left"},
+                "click_count": {"type": "integer", "description": "Click count: 1 for single, 2 for double (default 1)", "default": 1},
+                "delay_ms": {"type": "integer", "description": "Delay between mousedown and mouseup in ms (default 50)", "default": 50},
+            },
+            "required": ["x", "y"],
+        },
+    ),
+    Tool(
+        name="cdp_wait_for",
+        description="Smart wait: poll until a CSS selector or visible text appears/disappears or matches a desired state. More efficient than blind cdp_wait.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector to wait for"},
+                "text": {"type": "string", "description": "Visible text to wait for (substring match). Use when selector is unstable."},
+                "state": {"type": "string", "enum": ["visible", "hidden", "attached", "gone"], "description": "Target state (default: visible)", "default": "visible"},
+                "timeout_ms": {"type": "integer", "description": "Max wait time in ms (default 5000)", "default": 5000},
+                "poll_ms": {"type": "integer", "description": "Polling interval in ms (default 200)", "default": 200},
+            },
+        },
+    ),
     # Session & Profile
     Tool(
         name="cdp_cookies_get",
@@ -878,6 +1213,27 @@ async def _dispatch(name: str, args: dict) -> list[TextContent]:
         # Screenshot
         case "cdp_screenshot":
             return _ok(await _screenshot(args.get("selector"), args.get("quality", 80)))
+        case "cdp_screenshot_annotated":
+            return _ok(await _screenshot_annotated(
+                args.get("max_elements", 80),
+                args.get("min_size", 8),
+                args.get("quality", 80),
+            ))
+        case "cdp_click_xy":
+            return _ok(await _click_xy(
+                args["x"], args["y"],
+                args.get("button", "left"),
+                args.get("click_count", 1),
+                args.get("delay_ms", 50),
+            ))
+        case "cdp_wait_for":
+            return _ok(await _wait_for(
+                args.get("selector"),
+                args.get("text"),
+                args.get("state", "visible"),
+                args.get("timeout_ms", 5000),
+                args.get("poll_ms", 200),
+            ))
         # Session & Profile
         case "cdp_cookies_get":
             return _ok(await _cookies_get(args.get("domain")))
