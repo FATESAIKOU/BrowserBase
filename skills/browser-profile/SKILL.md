@@ -6,6 +6,7 @@ description: Use your personal browser profile for authenticated web browsing. U
 # Browser Profile
 
 A persistent Chrome browser with CDP on port 9222. All logins/cookies survive restarts.
+Backed by a Python MCP server at `mcp-servers/cdp-server.py`.
 
 ## Install
 
@@ -48,7 +49,7 @@ If not running, start it. If port is busy:
 lsof -ti:9222 | xargs kill -9
 ```
 
-## Available Tools (20)
+## Available Tools (28)
 
 ### Navigation & Info
 - **cdp_navigate(url, wait_ms?)** — Go to a URL.
@@ -59,20 +60,36 @@ lsof -ti:9222 | xargs kill -9
 - **cdp_get_links(max_results?, filter?)** — Links with href and text.
 - **cdp_get_form_elements(form_selector?)** — All form inputs with attributes.
 
-### Interaction
+### Interaction — High-Level
 - **cdp_click(text?, selector?, index?)** — Click by text or CSS selector.
 - **cdp_fill(target, value, by?)** — Fill input. by: auto/name/id/selector/placeholder.
 - **cdp_select(target, value?, label?)** — Select dropdown option.
 - **cdp_scroll(to?, pixels?, selector?)** — Scroll page.
+
+### Interaction — Vision-Enabled (Coordinate-Based)
+For SPAs (Gmail, Notion, Linear) or obfuscated UIs where CSS selectors are unreliable.
+
+- **cdp_click_xy(x, y, button?, click_count?, delay_ms?)** — Click at viewport coordinates (CSS pixels) using real CDP mouse events. **Auto-validates target visibility** before clicking; returns `[ERROR] target at (x,y) is hidden` if the element is zero-size, invisible, or behind another element. Preferred over `cdp_click` for SPAs.
+- **cdp_hover(x, y)** — Hover the mouse at coordinates. Use for triggering dropdown menus, tooltips, expandable UI.
+- **cdp_drag(from_x, from_y, to_x, to_y, steps?, delay_ms?)** — Drag from one position to another. Use for sliders, sortable lists, gesture-based interactions.
+- **cdp_key(key, modifiers?, repeat?)** — Send a keyboard key press (keyDown + char + keyUp). Supports `Enter`, `Tab`, `Escape`, `ArrowDown`, `ArrowUp`, `ArrowLeft`, `ArrowRight`, `Backspace`, `Delete`, single chars (`a`, `A`, `!`). Modifiers: `'Ctrl,Shift'`, `'Cmd'`, `'Alt'`.
+
+### Screenshot (vision models)
+- **cdp_screenshot(selector?, quality?)** — Save to file, returns path. Use Read tool to view.
+- **cdp_screenshot_annotated(max_elements?, min_size?, quality?)** — Screenshot with every interactive element outlined + numbered. Also writes a JSON manifest (`annotated_*.json`) mapping each `#N` to `{i, tag, text, role, sel, x, y, w, h}`. Detects `<div role="button" data-tooltip="次">`, `[data-testid]`, `[onclick]`, and other SPA patterns. Use this to visually find elements, then call `cdp_click_xy(x + w/2, y + h/2)`.
+
+### Waiting & Smart Wait
+- **cdp_ready(timeout_ms?)** — Wait for readyState=complete.
+- **cdp_wait(ms?)** — Blind pause in ms.
+- **cdp_wait_for(selector?, text?, state?, timeout_ms?, poll_ms?, match?)** — Poll until element/text matches desired state. `match` modes: `'contains'` (default, unicode-normalized substring), `'exact'`, `'regex'`. Handles i18n characters (CJK, en-dash, zero-width spaces) automatically via NFKC normalization.
+- **cdp_fingerprint(selector?, strip_digits?)** — Hash visible page text. Use to detect whether virtualized content (Gmail, Notion, Linear) actually changed after a scroll/page transition. Compare before/after fingerprints.
 
 ### Session & Profile
 - **cdp_cookies_get(domain?)** — Get cookies. Check auth status.
 - **cdp_login_check(url, logged_in_selector?, logged_out_selector?)** — Navigate + check login. Returns URL, cookies, page snippet.
 - **cdp_storage(location, key, value?)** — Read/write localStorage/sessionStorage.
 
-### Waiting & Debugging
-- **cdp_ready(timeout_ms?)** — Wait for readyState=complete.
-- **cdp_wait(ms?)** — Pause N ms.
+### Console & Debug
 - **cdp_console()** — Capture/retrieve console messages.
 
 ### Tab Management
@@ -80,11 +97,11 @@ lsof -ti:9222 | xargs kill -9
 - **cdp_list_tabs()** — List tabs.
 - **cdp_switch_tab(index?, match?)** — Switch tab.
 
-### Screenshot (vision models only)
-- **cdp_screenshot(selector?, quality?)** — Save to file, returns path. Use Read tool to view. Non-vision models: use text/links instead.
-
 ### Escape Hatch
-- **cdp_evaluate(code)** — Execute JS. Use IIFE `(()=>{...})()`.
+- **cdp_evaluate(code, await_promise?, return_result?)** — Execute JS. Set `await_promise=true` for async code. Use IIFE `(()=>{...})()`.
+
+### Batch
+- **cdp_batch(steps)** — Execute multiple tool calls sequentially in a single WebSocket connection. Faster than individual calls. Steps: `[{tool, args}, ...]`. Returns one line per step.
 
 ## Standard Workflow
 
@@ -108,12 +125,40 @@ Use `cdp_login_check` before any authenticated action. Check redirect, known sel
 ### 5. Forms
 1. `cdp_get_form_elements` → `cdp_fill` → `cdp_select` → `cdp_evaluate` to submit
 
+### 6. Vision-driven interaction (for SPAs / obfuscated UIs)
+1. `cdp_screenshot_annotated` → find element `#N` in image
+2. Read `annotated_*.json` manifest to get `x, y, w, h`
+3. `cdp_click_xy(x + w/2, y + h/2)`
+4. `cdp_fingerprint` before/after to verify content changed
+5. Use `cdp_hover(x, y)` for dropdown menus, `cdp_drag` for sliders
+6. Use `cdp_key('Enter')` or `cdp_key('Tab')` for keyboard navigation
+
+### 7. Multi-step operations
+1. Build a `cdp_batch` array of steps, e.g.:
+   ```json
+   [
+     {"tool": "cdp_click_xy", "args": {"x": 682, "y": 88}},
+     {"tool": "cdp_wait_for", "args": {"text": "51–100", "match": "contains"}},
+     {"tool": "cdp_get_text", "args": {"max_length": 5000}}
+   ]
+   ```
+2. Batch reuses the same WebSocket, avoiding TLS handshake overhead.
+
 ## Screenshot Notes
 
 - Saves to project `screenshots/` directory
-- Returns file path — use Read tool to view
-- Vision models: use for layout/CAPTCHA checks
-- Non-vision models: skip, use `cdp_get_text` + `cdp_get_links` instead
+- `cdp_screenshot` returns file path — use Read tool to view
+- `cdp_screenshot_annotated` returns both annotated PNG + JSON manifest
+- Vision models: use annotated screenshot to locate elements by number
+- Non-vision models: use `cdp_get_text` + `cdp_get_links` + manifest JSON
+
+## WebSocket Performance
+
+The MCP server maintains a **persistent WebSocket** to the active Chrome tab.
+All tools reuse this connection, avoiding the TLS handshake penalty of
+opening a new WS on every single tool call. This reduces per-operation
+latency by 20-30%. `cdp_switch_tab` invalidates the session, and the next
+tool call automatically reconnects to the newly active tab.
 
 ## Profile Location
 
