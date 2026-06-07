@@ -23,6 +23,7 @@ import hashlib
 import time
 import traceback
 import unicodedata
+import glob
 
 import httpx
 import websockets
@@ -53,6 +54,8 @@ class _Session:
         self._ws = None
         self._target_id = None
         self._msg_counter = 0
+        # Cache the most recent annotated manifest for cdp_click_element_ref
+        self.last_manifest = None  # {"path": str, "elements": [...], "image_size": {...}}
 
     def _targets(self) -> list[dict]:
         import httpx as _httpx
@@ -102,29 +105,10 @@ class _Session:
             if page is None:
                 raise RuntimeError("No page target found and could not create one")
         await self._connect(page)
-        # Force DPR=1 so screenshot pixels == CSS pixels (1:1 with click coords)
-        # Query current viewport size via CDP directly (avoid recursive _evaluate call)
-        try:
-            self._msg_counter += 1
-            await self._ws.send(json.dumps({
-                "id": self._msg_counter,
-                "method": "Runtime.evaluate",
-                "params": {"expression": "JSON.stringify({w: innerWidth, h: innerHeight})", "returnByValue": True}
-            }))
-            size_resp = json.loads(await self._ws.recv())
-            size = json.loads(size_resp.get("result", {}).get("result", {}).get("value", "{}"))
-            w = int(size.get("w", 1280))
-            h = int(size.get("h", 800))
-            # Lock DPR=1
-            self._msg_counter += 1
-            await self._ws.send(json.dumps({
-                "id": self._msg_counter,
-                "method": "Emulation.setDeviceMetricsOverride",
-                "params": {"width": w, "height": h, "deviceScaleFactor": 1, "mobile": False}
-            }))
-            await self._ws.recv()  # drain response
-        except Exception:
-            pass  # best-effort; if it fails, fall back to OS DPR
+        # NOTE: Don't lock DPR=1 here. Keeping native OS scale factor
+        # preserves text/visual rendering quality. Screenshots are resized
+        # back to CSS pixel dimensions in _screenshot / _screenshot_annotated
+        # so click coordinates stay 1:1 with the saved image.
 
     async def send(self, method: str, params: dict | None = None) -> dict:
         async with self._lock:
@@ -321,6 +305,65 @@ async def _click_xy(
     except Exception as e:
         return f"[ERROR] click_xy failed: {e}"
     return f"clicked at ({x}, {y}) button={button} count={click_count}"
+
+
+async def _click_element_ref(
+    index: int,
+    manifest_path: str | None = None,
+    button: str = "left",
+    click_count: int = 1,
+    delay_ms: int = 80,
+) -> str:
+    """#1: Click an element by its index from the most recent cdp_screenshot_annotated manifest.
+    Resolves the element's bounding rect and dispatches a real mouse event at the center.
+    Avoids manual coordinate math — just say cdp_click_element_ref(5) to click #5.
+    """
+    # Pick manifest source: explicit path > last_manifest > scan screenshots dir for newest
+    manifest = None
+    if manifest_path:
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception as e:
+            return f"[ERROR] Failed to read manifest at {manifest_path}: {e}"
+    elif _session.last_manifest and os.path.exists(_session.last_manifest["path"]):
+        manifest = _session.last_manifest
+    else:
+        # Fallback: find the newest annotated manifest in screenshots/
+        try:
+            files = sorted(glob.glob(os.path.join(SCREENSHOT_DIR, "annotated_*.json")),
+                           key=os.path.getmtime, reverse=True)
+            if files:
+                with open(files[0], "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                # Also cache it for future calls
+                _session.last_manifest = {
+                    "path": files[0],
+                    "elements": manifest.get("elements", []),
+                    "image_size": manifest.get("image_size", {}),
+                }
+        except Exception:
+            pass
+
+    if not manifest:
+        return "[ERROR] No manifest found. Run cdp_screenshot_annotated first to generate one."
+
+    elements = manifest.get("elements", [])
+    el = next((e for e in elements if e.get("i") == index), None)
+    if not el:
+        max_i = max((e.get("i", -1) for e in elements), default=-1)
+        return f"[ERROR] Element #{index} not in manifest (valid range: 0..{max_i})"
+
+    x = el["x"] + el["w"] / 2
+    y = el["y"] + el["h"] / 2
+    # Delegate to _click_xy for the actual mouse event + visibility check
+    result = await _click_xy(x, y, button=button, click_count=click_count, delay_ms=delay_ms)
+    if result.startswith("[ERROR]"):
+        return f"{result} [element #{index} = {el.get('tag', '?')} '{el.get('text', '')[:30]}']"
+    return (
+        f"clicked element #{index} at ({x:.0f}, {y:.0f}) "
+        f"[{el.get('tag', '?')} '{el.get('text', '')[:30]}'] via {manifest.get('image_size') and 'cached manifest'}"
+    )
 
 
 async def _hover(x: float, y: float) -> str:
@@ -556,6 +599,10 @@ async def _scroll(to: str | None = None, pixels: int | None = None, selector: st
 # ── Screenshot ────────────────────────────────────────────────────────────────
 
 async def _screenshot(selector: str | None = None, quality: int = 80) -> str:
+    try:
+        from PIL import Image
+    except ImportError:
+        return "[ERROR] PIL (Pillow) is required for auto-CSS resize. Install with: pip install Pillow"
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     quality = min(max(quality, 1), 100)
     fmt_param = "png" if quality >= 100 else "jpeg"
@@ -588,15 +635,32 @@ async def _screenshot(selector: str | None = None, quality: int = 80) -> str:
     ext = fmt_param
     filename = f"screenshot_{timestamp}.{ext}"
     filepath = os.path.join(SCREENSHOT_DIR, filename)
-    with open(filepath, "wb") as f:
-        f.write(img_bytes)
 
-    size_kb = len(img_bytes) / 1024
+    # #3: Resize to CSS pixel dimensions so click coords = image coords 1:1
+    # Get viewport size first
+    vw_vh = await _evaluate("JSON.stringify({w: innerWidth, h: innerHeight})")
+    try:
+        vw, vh = json.loads(vw_vh).get("w"), json.loads(vw_vh).get("h")
+    except Exception:
+        vw, vh = None, None
+    # Use clip dims if selector was given
+    target_w = (params.get("clip", {}).get("width") if selector else vw)
+    target_h = (params.get("clip", {}).get("height") if selector else vh)
+
+    from io import BytesIO
+    img = Image.open(BytesIO(img_bytes))
+    if target_w and target_h and img.size != (int(target_w), int(target_h)):
+        img = img.resize((int(target_w), int(target_h)), Image.LANCZOS)
+    save_kwargs = {"quality": quality} if fmt_param == "jpeg" else {"optimize": True}
+    img.save(filepath, fmt_param.upper() if fmt_param == "png" else "JPEG", **save_kwargs)
+
+    size_kb = os.path.getsize(filepath) / 1024
     url = await _evaluate("window.location.href")
     return (
         f"Screenshot saved.\n"
         f"File: {filepath}\n"
         f"Size: {size_kb:.1f} KB\n"
+        f"Image size: {img.size[0]}x{img.size[1]} (CSS pixels, click coords 1:1)\n"
         f"Format: {fmt_param}\n"
         f"URL: {url}\n"
         f"(Use the Read tool to view the image at the path above)"
@@ -685,10 +749,21 @@ async def _screenshot_annotated(
     img_bytes = base64.b64decode(result["data"])
     timestamp = int(time.time() * 1000)
     raw_path = os.path.join(SCREENSHOT_DIR, f"screenshot_{timestamp}.{fmt_param}")
-    with open(raw_path, "wb") as f:
-        f.write(img_bytes)
 
-    img = Image.open(raw_path).convert("RGBA")
+    # #3: Resize image to CSS pixel dimensions so click coords = image coords 1:1
+    from io import BytesIO
+    img_raw = Image.open(BytesIO(img_bytes))
+    css_w = int(viewport.get("w", img_raw.size[0]))
+    css_h = int(viewport.get("h", img_raw.size[1]))
+    if img_raw.size != (css_w, css_h):
+        img_raw = img_raw.resize((css_w, css_h), Image.LANCZOS)
+    img_raw.save(raw_path, fmt_param.upper() if fmt_param == "png" else "JPEG",
+                 quality=quality if fmt_param == "jpeg" else None,
+                 optimize=True if fmt_param == "png" else False)
+    img = img_raw.convert("RGBA")
+
+    # #4: Stamp image_size on manifest so consumers can verify coord system
+    manifest["image_size"] = {"w": css_w, "h": css_h}
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
@@ -732,6 +807,13 @@ async def _screenshot_annotated(
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
+    # #1: Cache for cdp_click_element_ref — resolves #N without coordinate math
+    _session.last_manifest = {
+        "path": manifest_path,
+        "elements": elements,
+        "image_size": {"w": css_w, "h": css_h},
+    }
+
     size_kb = os.path.getsize(annotated_path) / 1024
     url = await _evaluate("window.location.href")
     return "\n".join([
@@ -739,11 +821,13 @@ async def _screenshot_annotated(
         f"Image: {annotated_path} ({size_kb:.1f} KB)",
         f"Manifest: {manifest_path}",
         f"Elements annotated: {len(elements)} / viewport: {viewport.get('w')}x{viewport.get('h')}",
+        f"Image size: {css_w}x{css_h} (CSS pixels, click coords 1:1)",
         f"URL: {url}",
         f"",
-        f"Manifest format: array of {{i, tag, type, text, role, sel, x, y, w, h}}",
+        f"Manifest format: array of {{i, tag, type, text, role, sel, x, y, w, h, image_size}}",
         f"Use 'sel' to target an element (e.g. document.querySelector('<sel>'))",
-        f"Use cdp_click_xy(x + w/2, y + h/2) to click an element by its number.",
+        f"Use cdp_click_element_ref(i) to click element #i by manifest index.",
+        f"Or use cdp_click_xy(x + w/2, y + h/2) to click by coordinates.",
     ])
 
 # ── Wait tools ─────────────────────────────────────────────────────────────────
@@ -1152,6 +1236,14 @@ TOOLS = [
              "click_count":{"type":"integer","description":"Click count: 1 for single, 2 for double (default 1)","default":1},
              "delay_ms":{"type":"integer","description":"Delay between mousedown and mouseup in ms (default 80)","default":80}},
              "required":["x","y"]}),
+    Tool(name="cdp_click_element_ref",
+         description="Click an element by its index from the most recent cdp_screenshot_annotated manifest (#1, #5, etc.). Avoids manual coordinate math. The manifest is cached automatically; optionally pass manifest_path to target a specific one. Falls back to scanning screenshots/ for the newest manifest if cache is empty.",
+         inputSchema={"type":"object","properties":{
+             "index":{"type":"integer","description":"Element index from manifest (0-based, matches the #N label in the annotated image)"},
+             "manifest_path":{"type":"string","description":"Path to a specific annotated manifest JSON. If omitted, uses the most recent manifest (cached or newest on disk)."},
+             "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button (default: left)","default":"left"},
+             "click_count":{"type":"integer","description":"Click count: 1 for single, 2 for double (default 1)","default":1}},
+             "required":["index"]}),
     Tool(name="cdp_hover",
          description="Hover the mouse at viewport coordinates. Useful for triggering hover menus, tooltips, and expandable UI patterns in SPAs.",
          inputSchema={"type":"object","properties":{
@@ -1305,6 +1397,8 @@ async def _dispatch(name: str, args: dict) -> list[TextContent]:
             return _ok(await _scroll(args.get("to"), args.get("pixels"), args.get("selector")))
         case "cdp_click_xy":
             return _ok(await _click_xy(args["x"], args["y"], args.get("button", "left"), args.get("click_count", 1), args.get("delay_ms", 80)))
+        case "cdp_click_element_ref":
+            return _ok(await _click_element_ref(args["index"], args.get("manifest_path"), args.get("button", "left"), args.get("click_count", 1), args.get("delay_ms", 80)))
         case "cdp_hover":
             return _ok(await _hover(args["x"], args["y"]))
         case "cdp_drag":

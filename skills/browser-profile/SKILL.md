@@ -70,13 +70,14 @@ lsof -ti:9222 | xargs kill -9
 For SPAs (Gmail, Notion, Linear) or obfuscated UIs where CSS selectors are unreliable.
 
 - **cdp_click_xy(x, y, button?, click_count?, delay_ms?)** — Click at viewport coordinates (CSS pixels) using real CDP mouse events. **Auto-validates target visibility** before clicking; returns `[ERROR] target at (x,y) is hidden` if the element is zero-size, invisible, or behind another element. Preferred over `cdp_click` for SPAs.
+- **cdp_click_element_ref(index, manifest_path?)** — Click an element by its `#N` index from the most recent `cdp_screenshot_annotated` manifest. Resolves bounding rect + center + dispatches real mouse events internally — no manual coordinate math. Manifest is cached after each annotated screenshot; pass `manifest_path` to target a specific one. Falls back to scanning `screenshots/` for the newest manifest if cache is empty. **Preferred over `cdp_click_xy` for SPA clicks** when you already have an annotated screenshot.
 - **cdp_hover(x, y)** — Hover the mouse at coordinates. Use for triggering dropdown menus, tooltips, expandable UI.
-- **cdp_drag(from_x, from_y, to_x, to_y, steps?, delay_ms?)** — Drag from one position to another. Use for sliders, sortable lists, gesture-based interactions.
+- **cdp_drag(from_x, from_y, to_x, to_y, steps?, delay_ms?)** — Drag from one viewport position to another. Useful for sliders, sortable lists, and gesture-based UI.
 - **cdp_key(key, modifiers?, repeat?)** — Send a keyboard key press (keyDown + char + keyUp). Supports `Enter`, `Tab`, `Escape`, `ArrowDown`, `ArrowUp`, `ArrowLeft`, `ArrowRight`, `Backspace`, `Delete`, single chars (`a`, `A`, `!`). Modifiers: `'Ctrl,Shift'`, `'Cmd'`, `'Alt'`.
 
 ### Screenshot (vision models)
-- **cdp_screenshot(selector?, quality?)** — Save to file, returns path. Use Read tool to view.
-- **cdp_screenshot_annotated(max_elements?, min_size?, quality?)** — Screenshot with every interactive element outlined + numbered. Also writes a JSON manifest (`annotated_*.json`) mapping each `#N` to `{i, tag, text, role, sel, x, y, w, h}`. Detects `<div role="button" data-tooltip="次">`, `[data-testid]`, `[onclick]`, and other SPA patterns. Use this to visually find elements, then call `cdp_click_xy(x + w/2, y + h/2)`.
+- **cdp_screenshot(selector?, quality?)** — Save to file, returns path. Use Read tool to view. **Image is auto-resized to CSS pixel dimensions** (1:1 with `cdp_click_xy` coordinates) regardless of OS DPR. `quality` < 100 → JPEG; `quality` >= 100 → PNG.
+- **cdp_screenshot_annotated(max_elements?, min_size?, quality?)** — Screenshot with every interactive element outlined + numbered. Writes `annotated_*.png` (resized to CSS 1:1) + `annotated_*.json` manifest. Manifest now includes `image_size: {w, h}` so consumers can verify the coord system. Mapping per `#N`: `{i, tag, text, role, sel, x, y, w, h}`. Detects `<div role="button" data-tooltip="次">`, `[data-testid]`, `[onclick]`, and other SPA patterns. **Next step: `cdp_click_element_ref(N)`** to click `#N` directly (no coordinate math).
 
 ### Waiting & Smart Wait
 - **cdp_ready(timeout_ms?)** — Wait for readyState=complete.
@@ -127,11 +128,11 @@ Use `cdp_login_check` before any authenticated action. Check redirect, known sel
 
 ### 6. Vision-driven interaction (for SPAs / obfuscated UIs)
 1. `cdp_screenshot_annotated` → find element `#N` in image
-2. Read `annotated_*.json` manifest to get `x, y, w, h`
-3. `cdp_click_xy(x + w/2, y + h/2)`
-4. `cdp_fingerprint` before/after to verify content changed
-5. Use `cdp_hover(x, y)` for dropdown menus, `cdp_drag` for sliders
-6. Use `cdp_key('Enter')` or `cdp_key('Tab')` for keyboard navigation
+2. `cdp_click_element_ref(N)` — click `#N` directly (preferred)
+   - Or read `annotated_*.json` manifest to get `x, y, w, h` and call `cdp_click_xy(x + w/2, y + h/2)` (manual fallback)
+3. `cdp_fingerprint` before/after to verify content changed
+4. Use `cdp_hover(x, y)` for dropdown menus, `cdp_drag` for sliders
+5. Use `cdp_key('Enter')` or `cdp_key('Tab')` for keyboard navigation
 
 ### 7. Multi-step operations
 1. Build a `cdp_batch` array of steps, e.g.:
@@ -147,10 +148,10 @@ Use `cdp_login_check` before any authenticated action. Check redirect, known sel
 ## Screenshot Notes
 
 - Saves to project `screenshots/` directory
-- `cdp_screenshot` returns file path — use Read tool to view
-- `cdp_screenshot_annotated` returns both annotated PNG + JSON manifest
-- Vision models: use annotated screenshot to locate elements by number
-- Non-vision models: use `cdp_get_text` + `cdp_get_links` + manifest JSON
+- `cdp_screenshot` returns file path + `Image size: WxH (CSS pixels, click coords 1:1)` line — use Read tool to view
+- `cdp_screenshot_annotated` returns annotated PNG + JSON manifest. Manifest now includes `image_size: {w, h}` (same as CSS viewport) so `x + w/2, y + h/2` in manifest == pixel coords in image == CDP `Input.dispatchMouseEvent` coords. No DPR math needed.
+- Vision models: use annotated screenshot to locate elements by number, then `cdp_click_element_ref(N)`
+- Non-vision models: use `cdp_get_text` + `cdp_get_links` + manifest JSON + `cdp_click_element_ref(N)`
 
 ## WebSocket Performance
 
