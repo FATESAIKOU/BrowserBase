@@ -139,11 +139,6 @@ async def _evaluate(expression: str, await_promise: bool = False) -> str:
     if "result" in result:
         value = result["result"].get("value", "")
         if isinstance(value, str):
-            if not value and "exceptionDetails" in result:
-                import sys
-                exc = result["exceptionDetails"]
-                text = exc.get("text", "") or exc.get("exception", {}).get("description", "")
-                print(f"[DEBUG] JS exception: {text[:200]}", file=sys.stderr)
             return value
         return json.dumps(value, ensure_ascii=False)
     return json.dumps(result, ensure_ascii=False)
@@ -913,9 +908,6 @@ async def _wait_for(
             try:
                 info = json.loads(result_str)
             except Exception:
-                import sys
-                print(f"[DEBUG] FULL check_js:\n{check_js}", file=sys.stderr)
-                print(f"[DEBUG] result_str: {result_str[:200]}", file=sys.stderr)
                 info = {"found": False, "visible": False}
 
             is_absent = info.get("found") is None or info.get("found") is False or result_str == "absent"
