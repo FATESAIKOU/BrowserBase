@@ -139,6 +139,11 @@ async def _evaluate(expression: str, await_promise: bool = False) -> str:
     if "result" in result:
         value = result["result"].get("value", "")
         if isinstance(value, str):
+            if not value and "exceptionDetails" in result:
+                import sys
+                exc = result["exceptionDetails"]
+                text = exc.get("text", "") or exc.get("exception", {}).get("description", "")
+                print(f"[DEBUG] JS exception: {text[:200]}", file=sys.stderr)
             return value
         return json.dumps(value, ensure_ascii=False)
     return json.dumps(result, ensure_ascii=False)
@@ -553,10 +558,12 @@ async def _fill(target: str, value: str, by: str = "auto") -> str:
 
 async def _select(target: str, value: str | None = None, label: str | None = None) -> str:
     escaped_target = json.dumps(target)
+    # For template literals, use the raw target escaped for JS string
+    raw_target = target.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
     if value:
         code = f"""
         (() => {{
-            const el = document.querySelector({escaped_target}) || document.querySelector(`select[name="{escaped_target}"]`);
+            const el = document.querySelector({escaped_target}) || document.querySelector(`select[name="{raw_target}"]`);
             if (!el || el.tagName !== 'SELECT') return 'ERROR: select not found: ' + {escaped_target};
             el.value = {json.dumps(value)};
             el.dispatchEvent(new Event('change', {{bubbles: true}}));
@@ -566,7 +573,7 @@ async def _select(target: str, value: str | None = None, label: str | None = Non
     elif label:
         code = f"""
         (() => {{
-            const el = document.querySelector({escaped_target}) || document.querySelector(`select[name="{escaped_target}"]`);
+            const el = document.querySelector({escaped_target}) || document.querySelector(`select[name="{raw_target}"]`);
             if (!el || el.tagName !== 'SELECT') return 'ERROR: select not found: ' + {escaped_target};
             for (const opt of el.options) {{
                 if (opt.textContent.trim() === {json.dumps(label)}) {{
@@ -858,29 +865,16 @@ async def _wait_for(
     if state not in ("visible", "hidden", "attached", "gone"):
         return f"[ERROR] Unknown state: {state}"
 
-    # Build the match strategy JS (#4)
-    match_js = ""
+    # Build the match strategy JS (#4) — must be a single expression, no return/const
+    match_expr = ""
     norm_text = _norm(text) if text else ""
 
     if match == "exact" and text:
-        match_js = f"""
-        const want = {json.dumps(norm_text)};
-        const t = (el.textContent || '').trim();
-        return t.normalize('NFKC').trim() === want;
-        """
+        match_expr = f"(el.textContent||'').trim().normalize('NFKC').trim()==={json.dumps(norm_text)}"
     elif match == "regex" and text:
-        match_js = f"""
-        try {{
-            const re = new RegExp({json.dumps(text)}, 'i');
-            return re.test(el.textContent || '');
-        }} catch(e) {{ return false; }}
-        """
+        match_expr = f"(function(){{try{{return new RegExp({json.dumps(text)},'i').test(el.textContent||'')}}catch(e){{return false}}}})()"
     else:  # contains (default), with unicode-normalized comparison
-        match_js = f"""
-        const want = {json.dumps(norm_text)};
-        const t = (el.textContent || '').normalize('NFKC');
-        return t.includes(want);
-        """
+        match_expr = f"(el.textContent||'').normalize('NFKC').includes({json.dumps(norm_text)})"
 
     deadline = time.time() + timeout_ms / 1000
     last_err = ""
@@ -891,13 +885,15 @@ async def _wait_for(
             elif text:
                 sel_part = f"""
                 let el = null;
+                let _found = false;
                 const txt = {json.dumps(norm_text)};
-                const all = document.querySelectorAll('*');
-                for (const n of all) {{
-                    if (n.children.length === 0 && ({match_js}) {{
-                        el = n; break;
+                const all = document.body.querySelectorAll('*');
+                for (el of all) {{
+                    if (el.children.length === 0 && ({match_expr})) {{
+                        _found = true; break;
                     }}
                 }}
+                if (!_found) el = null;
                 """
 
             check_js = f"""
@@ -917,6 +913,9 @@ async def _wait_for(
             try:
                 info = json.loads(result_str)
             except Exception:
+                import sys
+                print(f"[DEBUG] FULL check_js:\n{check_js}", file=sys.stderr)
+                print(f"[DEBUG] result_str: {result_str[:200]}", file=sys.stderr)
                 info = {"found": False, "visible": False}
 
             is_absent = info.get("found") is None or info.get("found") is False or result_str == "absent"
