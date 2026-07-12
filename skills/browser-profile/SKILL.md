@@ -10,10 +10,24 @@ Backed by a Python MCP server at `mcp-servers/cdp-server.py`.
 
 ## Install
 
+### OpenCode
 ```bash
 cd ~/testAI/BrowserBase
-bash install.sh ~/.config/opencode
+bash scripts/mcp-install-for-opencode.sh ~/.config/opencode
 ```
+
+### AionUi
+```bash
+cd ~/testAI/BrowserBase
+bash scripts/mcp-install-for-aionui.sh
+```
+
+### Other MCP clients (Claude Code, Cursor, etc.)
+```bash
+cd ~/testAI/BrowserBase
+bash scripts/mcp-install-for-opencode.sh ~/.config/opencode
+```
+(Adapt the target path for your client.)
 
 ## Start the Browser
 
