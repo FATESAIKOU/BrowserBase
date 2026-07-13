@@ -1,4 +1,2 @@
 user_profile/
-screenshots/
-mcp-servers/__pycache__/
-.opencode/
+.mcp/
