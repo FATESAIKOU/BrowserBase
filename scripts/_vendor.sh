@@ -18,14 +18,6 @@ update_vendor() {
   echo "[vendor] chrome-devtools-mcp ${v} ready"
 }
 
-link_skill() {   # link_skill <client_skills_dir>
-  local dir="$1"
-  [ -d "$SKILL_SRC" ] || { echo "[skill] source missing: $SKILL_SRC" >&2; return 1; }
-  mkdir -p "$dir"
-  ln -sfn "$SKILL_SRC" "${dir}/chrome-devtools"
-  echo "[skill] ${dir}/chrome-devtools -> ${SKILL_SRC}"
-}
-
 # Remove <skills_dir>/chrome-devtools only if it is a symlink to our SKILL_SRC; anything else stays.
 unlink_skill() {   # unlink_skill <client_skills_dir>
   local link="$1/chrome-devtools"

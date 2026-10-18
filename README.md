@@ -52,15 +52,18 @@ bash scripts/install-opencode.sh    # vendors the server; removes old global Ope
 Both are idempotent (re-run to update the vendored server). Neither registers anything globally:
 the server's 29 tool definitions and the skill description would otherwise sit in the context of
 every session, including the many that never open a browser. Browser sessions opt in with the
-launchers below. The installers also remove what older versions wrote globally, and only that:
+launchers below. The installers also clean up what older versions wrote globally. They touch
+only the items listed here; everything else in your configs is left as it was:
 
 - Claude Code: the user-scope `chrome-devtools` MCP entry if it points at this repo's wrapper, and
   `~/.claude/skills/chrome-devtools` if it is a symlink to this repo's vendored skill.
 - OpenCode: `mcp["chrome-devtools"]` in the global `opencode.json` if it points at the wrapper, and
-  `skills/chrome-devtools` if it is a symlink to the vendored skill. Permissions, `update`, other
-  MCP servers and every other key are left exactly as they were. (Older versions also added a
-  `permission.external_directory` entry for this repo; it is indistinguishable from a user's own
-  rule, so it is left alone.)
+  `skills/chrome-devtools` if it is a symlink to the vendored skill. Also removed, because older
+  versions' cleanup did the same: `mcp["cdp-enh"]`, `permission["cdp_*"]` and `permission.bash`
+  rules ending in `start_browser.sh`. `update`, all other permissions, other MCP servers and
+  `$schema` are untouched. **Not removed:** the `permission.external_directory[<this repo>]` entry
+  older versions added; it cannot be told apart from a user's own rule and may be what lets an
+  agent read the linked skill, so it stays.
 
 ## Start a browser session (Claude Code)
 
@@ -69,9 +72,15 @@ scripts/browser-claude.sh            # same as `claude`, plus the chrome-devtool
 scripts/browser-claude.sh -p "…"     # any claude arguments are passed through
 ```
 
-It runs `exec claude --mcp-config '<json>' "$@"`, where the JSON points at
+It runs `exec claude "$@" --mcp-config '<json>'` (before a literal `--` if you pass one), where
+the JSON points at
 `scripts/chrome-devtools-wrapper.sh` (path derived from the script's own location, so nothing is
 hard-coded). Chrome is still started by the wrapper, never by Puppeteer.
+
+The flag goes last because `--mcp-config` takes a space-separated list (`<configs...>`): placed
+before a bare prompt it would swallow the prompt as another config. This is a session launcher; it
+is not meant for `claude` subcommands. (Not verified against the real parser, only against a stub
+that records the arguments.)
 
 `--mcp-config` alone **adds** the server to the session's existing MCP servers. We deliberately do
 not pass `--strict-mcp-config`, which would ignore every other MCP server (global, project
@@ -102,20 +111,33 @@ makes it start the server only for sessions in that directory and stop it afterw
    skill path; the docs do not say whether symlinks are followed).
 3. Runs `opencode <dir>` (override the command with `OPENCODE_BIN`).
 
-**Never committed:** in a git repo or worktree, the script appends the two paths (and its own state
-file `.opencode/.browserbase-state`) to the repo's `info/exclude` (resolved with
-`git rev-parse --git-path`, so worktrees work), skipping lines already present. If `opencode.json`
-is already **tracked** it stops with an error instead of editing it. `--remove` deletes the mcp key
-and the skill link, removes only the exclude lines it added, and deletes `opencode.json` only if the
-script created it and it is empty again. Outside a git repo it prints a reminder to keep these
-files out of any repo. Caveat: `info/exclude` is shared by all worktrees of a repo, so `--remove`
-in one worktree also drops the exclude lines the others rely on until they run the script again.
+**Keeping it out of git.** In a git repo or worktree the script appends these lines to the
+repo's `info/exclude` (resolved with `git rev-parse --git-path`, so worktrees work), skipping lines
+already present: `/<dir>/opencode.json`, `/<dir>/.opencode/skills/chrome-devtools` and its own state
+file `.opencode/.browserbase-state`, with the path anchored from the worktree root and
+`[ ] \ * ?` escaped. If `opencode.json` is already **tracked**, it stops with an error instead of
+editing it. Outside a git repo it only prints a reminder.
 
-Tests: `node --test test/browser-opencode.test.mjs` (temp dirs only; no opencode/Chrome started).
-Verified: config merge/removal, plain dir, git repo, worktree and worktree subdirectory (`git status`
-clean, exclude restored), tracked-file refusal, and both installers against copies of real configs.
+`info/exclude` is shared by all worktrees of a repo, which has two consequences:
+- A root-level rule would also hide another worktree's *own* untracked `opencode.json`. The script
+  refuses (before writing anything) if another worktree has such a file; use a subdirectory or
+  a different location instead.
+- `--remove` leaves the exclude lines in place while another worktree still has our state file,
+  and hands them over to it; the last worktree to run `--remove` removes them.
+
+`--remove` removes the mcp key (only if it is ours), the skill link (only if it is our symlink) and
+the exclude lines it added, and deletes `opencode.json` only if the script created it and nothing
+but our (empty) `mcp` is left in it.
+
+Tests: `node --test test/browser-opencode.test.mjs`. They run in throw-away temp dirs with a stub
+`claude` and `npm` first on `PATH` and `OPENCODE_BIN=true`; no opencode, claude or Chrome is
+started. The install scripts the tests run do create `user_profile/` and chmod the wrapper inside
+this repo (`update_vendor`). Covered: config merge/removal, foreign entries/links left alone,
+plain dir, git repo, worktree, worktree subdirectory, shared-exclude handling between worktrees,
+special characters in paths, tracked-file refusal, `install-opencode.sh` and `install-claude.sh`
+against synthetic configs, and `browser-claude.sh` argument order.
 Not verified: that a real OpenCode picks up the project MCP/skill (including through the symlink),
-or that a shared OpenCode service stops the server afterwards.
+that a shared OpenCode service stops the server afterwards, and the real `claude` argument parser.
 
 ## Use
 
