@@ -48,6 +48,16 @@ if [ "$REMOVE" = 0 ]; then
     echo "[ERROR] $CONFIG is tracked by git; refusing to modify a tracked file. Use an untracked directory/worktree." >&2
     exit 1
   fi
+  if [ "$IN_GIT" = 1 ] && [ "$CONFIG" != "$DIR/opencode.json" ] && [ -d "$(dirname "$CONFIG")" ]; then
+    # opencode.json is a symlink: the file we would rewrite is its target. Refuse if that target
+    # lives in this same repo and is tracked (it would show up modified, with our absolute paths).
+    REAL_TOP="$(git -C "$(dirname "$CONFIG")" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ "$REAL_TOP" = "$(git -C "$DIR" rev-parse --show-toplevel)" ] \
+       && git -C "$(dirname "$CONFIG")" ls-files --error-unmatch -- "$(basename "$CONFIG")" >/dev/null 2>&1; then
+      echo "[ERROR] $DIR/opencode.json is a symlink to $CONFIG, which is tracked by git in this repo; refusing to modify it (our absolute paths would end up in a commit)." >&2
+      exit 1
+    fi
+  fi
   if [ -e "$LINK" ] || [ -L "$LINK" ]; then
     [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$SKILL_SRC" ] || { echo "[ERROR] $LINK exists and is not ours" >&2; exit 1; }
   fi

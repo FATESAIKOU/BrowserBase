@@ -435,3 +435,37 @@ test('symlinked config (dotfiles): add / --remove / install keep the symlink, up
   assert.equal(mode(real), 0o640);
   rmSync(base, { recursive: true, force: true });
 });
+
+test('git: untracked opencode.json symlink -> tracked file in the same repo is refused, target untouched', () => {
+  const { base, e } = fixture();
+  const d = repo(base, 'main');
+  mkdirSync(path.join(d, 'config'));
+  const tracked = path.join(d, 'config/opencode.json');
+  writeFileSync(tracked, '{"a":1}\n');
+  git(d, 'add', '.'); git(d, 'commit', '-qm', 'cfg');
+  symlinkSync('config/opencode.json', path.join(d, 'opencode.json'));   // the link itself is untracked
+  const r = run('browser-opencode.sh', [d], e);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /tracked by git in this repo/);
+  assert.equal(readFileSync(tracked, 'utf8'), '{"a":1}\n');
+  assert.equal(git(d, 'status', '--porcelain', '-uall'), '?? opencode.json', 'no tracked file modified, nothing else created');
+  assert.equal(existsSync(path.join(d, '.opencode')), false);
+  assert.equal(run('browser-opencode.sh', ['--remove', d], e).status, 0);
+  assert.equal(readFileSync(tracked, 'utf8'), '{"a":1}\n');
+  rmSync(base, { recursive: true, force: true });
+});
+
+test('git: symlink to an untracked file in the same repo, or to a file in another repo, is allowed', () => {
+  const { base, e } = fixture();
+  const d = repo(base, 'main');
+  mkdirSync(path.join(d, 'local')); writeFileSync(path.join(d, 'local/opencode.json'), '{}');
+  symlinkSync('local/opencode.json', path.join(d, 'opencode.json'));
+  assert.equal(run('browser-opencode.sh', [d], e).status, 0);
+  const dots = repo(base, 'dots');                         // dotfiles repo: tracked there on purpose
+  writeFileSync(path.join(dots, 'opencode.json'), '{}\n'); git(dots, 'add', '.'); git(dots, 'commit', '-qm', 'c');
+  const p = path.join(base, 'proj'); mkdirSync(p);
+  const other = repo(base, 'other'); symlinkSync(path.join(dots, 'opencode.json'), path.join(other, 'opencode.json'));
+  assert.equal(run('browser-opencode.sh', [other], e).status, 0);
+  assert.ok(JSON.parse(readFileSync(path.join(dots, 'opencode.json'), 'utf8')).mcp['chrome-devtools']);
+  rmSync(base, { recursive: true, force: true });
+});

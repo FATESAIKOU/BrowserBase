@@ -117,7 +117,10 @@ makes it start the server only for sessions in that directory and stop it afterw
 `info/exclude` (resolved with `git rev-parse --git-path`, so worktrees work), skipping lines
 already present: `/<dir>/opencode.json`, `/<dir>/.opencode/skills/chrome-devtools` and its own state
 file `.opencode/.browserbase-state`, anchored from the worktree root with `[ ] \ * ?` escaped.
-If `opencode.json` is already **tracked**, it stops with an error instead of editing it. Outside a
+If `opencode.json` is already **tracked**, it stops with an error instead of editing it. The same
+applies when `opencode.json` is a symlink whose target is tracked in the same repo (the target is
+what would be rewritten); a symlink into a different repo, such as a dotfiles repo, is allowed and
+that file is updated. Outside a
 git repo it only prints a reminder.
 
 `--remove` removes the mcp key (only if it is ours), the skill link (only if it is our symlink) and
@@ -132,7 +135,8 @@ its worktrees). That is not free: from then on `git status` silently hides any u
 `opencode.json` or `.opencode/skills/chrome-devtools` of your own at the same path in that repo,
 including in other worktrees, and `git add opencode.json` is refused ("ignored by .gitignore")
 until you remove the lines. To drop exactly the three lines the script adds at the worktree root
-(exact whole-line matches, nothing else is touched; for a subdirectory use the same lines prefixed
+(exact whole-line matches, so no other line is touched; note that this also deletes identical
+lines you wrote yourself; for a subdirectory use the same lines prefixed
 with `/<subdir>`, with `[ ] \ * ?` backslash-escaped):
 
 ```bash
