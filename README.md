@@ -44,23 +44,47 @@ restarts, and the window is always visible.
 
 ## Install
 
-One installer per client — each is idempotent, and re-running updates the vendored server + skill:
-
 ```bash
-bash scripts/install-claude.sh      # Claude Code  (user scope)
+bash scripts/install-claude.sh      # Claude Code: vendors the server + skill, removes any old global MCP entry
 bash scripts/install-opencode.sh    # OpenCode     (~/.config/opencode)
 ```
 
-Each installer:
+`install-claude.sh` (idempotent; re-run to update):
 1. `npm install chrome-devtools-mcp@latest` into `.mcp/`.
-2. Registers the MCP server `chrome-devtools`, pointed at the wrapper.
-3. Symlinks the package's official `chrome-devtools` skill into the client's skills dir.
+2. Removes a `chrome-devtools` MCP entry that points at the wrapper (written by older versions);
+   other MCP servers are left alone.
+3. Symlinks the package's official `chrome-devtools` skill into `~/.claude/skills`.
 
-Restart the client afterwards.
+It does **not** register the MCP server globally. The server's 29 tool definitions would take up
+context in every Claude Code session, including the many that never open a browser.
+
+## Start a browser session (Claude Code)
+
+```bash
+scripts/browser-claude.sh            # same as `claude`, plus the chrome-devtools MCP
+scripts/browser-claude.sh -p "…"     # any claude arguments are passed through
+```
+
+It runs `exec claude --mcp-config '<json>' "$@"`, where the JSON points at
+`scripts/chrome-devtools-wrapper.sh` (path derived from the script's own location, so nothing is
+hard-coded). Chrome is still started by the wrapper, never by Puppeteer.
+
+`--mcp-config` alone **adds** the server to the session's existing MCP servers. We deliberately do
+not pass `--strict-mcp-config`, which would ignore every other MCP server (global, project
+`.mcp.json`, claude.ai connectors) and leave only this one.
+
+Skill note: the `chrome-devtools` skill is still linked globally, so its short description is in
+every session's context even though it is useless without the MCP tools. Remove
+`~/.claude/skills/chrome-devtools` if you want zero footprint outside browser sessions.
+
+Verified: `browser-claude.sh -p` showed the server connected (source `dynamic`) with 29
+`mcp__chrome-devtools__*` tools while the other server (claude.ai connector) stayed available; on a
+config without the old global entry, `claude mcp list` shows no `chrome-devtools`. Not verified:
+interactive (non-`-p`) sessions, and a project-level `.mcp.json` alternative.
 
 ## Use
 
-Just ask the agent to browse. The first tool call launches Chrome if it isn't already up.
+In a browser session, just ask the agent to browse. The first tool call launches Chrome if it isn't already up.
 
 ```
 > take a screenshot of my Gmail inbox
@@ -95,7 +119,8 @@ The wrapper reads these env vars (all optional):
 
 ```
 scripts/chrome-devtools-wrapper.sh   launches stock Chrome + attaches the official MCP server
-scripts/install-claude.sh            vendors + registers for Claude Code
+scripts/browser-claude.sh            starts Claude Code with the browser MCP attached (per session)
+scripts/install-claude.sh            vendors server + skill, removes old global MCP entry
 scripts/install-opencode.sh          vendors + registers for OpenCode
 scripts/_vendor.sh                   shared: npm install .mcp/ + skill symlink helpers
 .mcp/                                vendored chrome-devtools-mcp (server + skills, gitignored)
