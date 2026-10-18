@@ -88,8 +88,9 @@ test('refuses to overwrite a foreign mcp.chrome-devtools', () => {
   rmSync(base, { recursive: true });
 });
 
+const CLEANUP = String.raw`grep -vE '/(opencode\.json|\.opencode/(skills/chrome-devtools|\.browserbase-state))$' "$f" > "$f.new" && mv "$f.new" "$f"`;
 for (const kind of ['repo', 'worktree', 'subdir of worktree']) {
-  test(`git ${kind}: git status stays clean, exclude restored by --remove`, () => {
+  test(`git ${kind}: status clean; --remove keeps exclude lines; README cleanup command restores`, () => {
     const { base, e } = fixture();
     const main = repo(base, 'main');
     const wt = path.join(base, 'wt');
@@ -101,25 +102,30 @@ for (const kind of ['repo', 'worktree', 'subdir of worktree']) {
 
     for (let i = 0; i < 2; i++) assert.equal(run('browser-opencode.sh', [d], e).status, 0);
     assert.equal(git(d, 'status', '--porcelain', '-uall'), '', 'git status must be clean');
-    const lines = readFileSync(excludeFile, 'utf8').split('\n');
-    assert.equal(lines.filter((l) => l.endsWith('opencode.json')).length, 1, 'no duplicate exclude lines');
+    const afterAdd = readFileSync(excludeFile, 'utf8');
+    assert.equal(afterAdd.split('\n').filter((l) => l.endsWith('opencode.json')).length, 1, 'no duplicate exclude lines');
 
     assert.equal(run('browser-opencode.sh', ['--remove', d], e).status, 0);
-    assert.equal(existsSync(excludeFile) ? readFileSync(excludeFile, 'utf8') : '', before);
-    assert.equal(git(d, 'status', '--porcelain', '-uall'), '');
+    assert.equal(readFileSync(excludeFile, 'utf8'), afterAdd, '--remove must not edit info/exclude');
     assert.equal(existsSync(path.join(d, 'opencode.json')), false);
+    assert.equal(existsSync(path.join(d, '.opencode')), false);
+    assert.equal(git(d, 'status', '--porcelain', '-uall'), '');
+
+    // the manual cleanup command from the README restores the file
+    execFileSync('bash', ['-c', CLEANUP], { env: { ...process.env, f: excludeFile } });
+    assert.equal(readFileSync(excludeFile, 'utf8'), before);
     rmSync(base, { recursive: true, force: true });
   });
 }
 
-test('git: a pre-existing exclude line is not removed by --remove', () => {
+test('git: a pre-existing exclude line is not duplicated', () => {
   const { base, e } = fixture();
   const d = repo(base, 'main');
   const ex = path.join(d, '.git/info/exclude');
   writeFileSync(ex, '/opencode.json\n');
   run('browser-opencode.sh', [d], e);
   run('browser-opencode.sh', ['--remove', d], e);
-  assert.equal(readFileSync(ex, 'utf8'), '/opencode.json\n');
+  assert.equal(readFileSync(ex, 'utf8').split('\n').filter((l) => l === '/opencode.json').length, 1);
   rmSync(base, { recursive: true, force: true });
 });
 
@@ -266,43 +272,100 @@ test('--remove only deletes our own entries (foreign mcp key / foreign link / us
   rmSync(base, { recursive: true, force: true });
 });
 
-test('worktrees share info/exclude: --remove in one keeps the other clean; last one cleans up', () => {
+test('worktrees: --remove in one leaves exclude lines, so the other worktree stays clean', () => {
   const { base, e } = fixture();
   const main = repo(base, 'main');
   const w1 = path.join(base, 'w1'), w2 = path.join(base, 'w2');
   git(main, 'worktree', 'add', '-q', '-b', 'b1', w1); git(main, 'worktree', 'add', '-q', '-b', 'b2', w2);
-  const ex = path.resolve(w1, git(w1, 'rev-parse', '--git-path', 'info/exclude'));
-  const before = readFileSync(ex, 'utf8');
   assert.equal(run('browser-opencode.sh', [w1], e).status, 0);
   assert.equal(run('browser-opencode.sh', [w2], e).status, 0);
-  const r = run('browser-opencode.sh', ['--remove', w1], e);
-  assert.equal(r.status, 0);
-  assert.match(r.stdout, /another worktree still uses/);
+  assert.equal(run('browser-opencode.sh', ['--remove', w1], e).status, 0);
   assert.equal(git(w2, 'status', '--porcelain', '-uall'), '', 'w2 must stay clean after w1 --remove');
-  assert.equal(run('browser-opencode.sh', ['--remove', w2], e).status, 0);
-  assert.equal(readFileSync(ex, 'utf8'), before, 'exclude fully restored by the last user');
+  assert.ok(existsSync(path.join(w2, 'opencode.json')));
+  // even if the owner worktree is deleted, nothing becomes exposed in the others
+  git(main, 'worktree', 'remove', '--force', w1);
+  assert.equal(git(w2, 'status', '--porcelain', '-uall'), '');
   rmSync(base, { recursive: true, force: true });
 });
 
-test('shared exclude never hides another worktree\'s own untracked opencode.json', () => {
+test('known trade-off: a same-path untracked opencode.json elsewhere in the repo is hidden too', () => {
   const { base, e } = fixture();
   const main = repo(base, 'main');
-  writeFileSync(path.join(main, 'opencode.json'), '{"mine":true}\n');   // main's own, untracked
   const wt = path.join(base, 'wt');
   git(main, 'worktree', 'add', '-q', '-b', 'f', wt);
-  const ex = path.resolve(main, git(main, 'rev-parse', '--git-path', 'info/exclude'));
-  const before = readFileSync(ex, 'utf8');
-  const r = run('browser-opencode.sh', [wt], e);       // root-level rule would hide main's file: refused
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /would hide it/);
-  assert.equal(readFileSync(ex, 'utf8'), before);
+  writeFileSync(path.join(main, 'opencode.json'), '{"mine":true}\n');
   assert.match(git(main, 'status', '--porcelain'), /\?\? opencode\.json/);
-  assert.equal(existsSync(path.join(wt, 'opencode.json')), false);
-  // a subdirectory run uses a fully anchored path and leaves main's root file visible
-  const sub = path.join(wt, 'sub'); mkdirSync(sub);
+  assert.equal(run('browser-opencode.sh', [wt], e).status, 0);
+  assert.equal(git(main, 'status', '--porcelain'), '', 'documented side effect of the shared exclude');
+  // a subdirectory run is anchored to that path and does not hide the root file
+  const main2 = repo(base, 'main2'); writeFileSync(path.join(main2, 'opencode.json'), '{}');
+  const sub = path.join(main2, 'sub'); mkdirSync(sub);
   assert.equal(run('browser-opencode.sh', [sub], e).status, 0);
-  assert.match(git(main, 'status', '--porcelain'), /\?\? opencode\.json/);
-  assert.equal(git(wt, 'status', '--porcelain', '-uall'), '');
+  assert.match(git(main2, 'status', '--porcelain'), /\?\? opencode\.json/);
+  rmSync(base, { recursive: true, force: true });
+});
+
+test('user\'s own opencode.json.tmp is never deleted (add, --remove, install-opencode)', () => {
+  const { base, e } = fixture();
+  const d = path.join(base, 'proj'); mkdirSync(d);
+  writeFileSync(path.join(d, 'opencode.json.tmp'), 'mine');
+  assert.equal(run('browser-opencode.sh', [d], e).status, 0);
+  assert.equal(run('browser-opencode.sh', ['--remove', d], e).status, 0);
+  assert.equal(readFileSync(path.join(d, 'opencode.json.tmp'), 'utf8'), 'mine');
+  // failure path (invalid JSON) too
+  writeFileSync(path.join(d, 'opencode.json'), '{broken');
+  assert.notEqual(run('browser-opencode.sh', [d], e).status, 0);
+  assert.equal(readFileSync(path.join(d, 'opencode.json.tmp'), 'utf8'), 'mine');
+  assert.deepEqual(execFileSync('ls', ['-A', d], { encoding: 'utf8' }).trim().split('\n').sort(), ['opencode.json', 'opencode.json.tmp']);
+
+  const st = stubs(base);
+  const home = path.join(base, 'oc'); mkdirSync(home);
+  writeFileSync(path.join(home, 'opencode.json'), JSON.stringify({ mcp: { 'cdp-enh': {} } }));
+  writeFileSync(path.join(home, 'opencode.json.tmp'), 'mine');
+  assert.equal(run('install-opencode.sh', [], { ...e, OPENCODE_HOME: home, PATH: st.PATH }).status, 0);
+  assert.equal(readFileSync(path.join(home, 'opencode.json.tmp'), 'utf8'), 'mine');
+  assert.deepEqual(readJson(path.join(home, 'opencode.json')), { mcp: {} });
+  assert.deepEqual(execFileSync('ls', ['-A', home], { encoding: 'utf8' }).trim().split('\n').sort(), ['opencode.json', 'opencode.json.tmp']);
+  rmSync(base, { recursive: true, force: true });
+});
+
+test('--remove: leftover {"mcp":{}} loses the empty key; file deleted only if we created it', () => {
+  const { base, e } = fixture();
+  // not created by us: {"mcp":{}} -> {} (file kept)
+  const d1 = path.join(base, 'p1'); mkdirSync(d1);
+  writeFileSync(path.join(d1, 'opencode.json'), '{"mcp":{}}');
+  assert.equal(run('browser-opencode.sh', ['--remove', d1], e).status, 0);
+  assert.deepEqual(readJson(path.join(d1, 'opencode.json')), {});
+  // created by us: deleted
+  const d2 = path.join(base, 'p2'); mkdirSync(d2);
+  run('browser-opencode.sh', [d2], e);
+  run('browser-opencode.sh', ['--remove', d2], e);
+  assert.equal(existsSync(path.join(d2, 'opencode.json')), false);
+  // mode of a user's file survives an add/remove cycle
+  const d3 = path.join(base, 'p3'); mkdirSync(d3);
+  writeFileSync(path.join(d3, 'opencode.json'), '{"a":1}'); chmodSync(path.join(d3, 'opencode.json'), 0o640);
+  run('browser-opencode.sh', [d3], e); run('browser-opencode.sh', ['--remove', d3], e);
+  assert.equal(lstatSync(path.join(d3, 'opencode.json')).mode & 0o777, 0o640);
+  rmSync(base, { recursive: true, force: true });
+});
+
+test('install-opencode.sh: unparsable config or string command -> skill link still removed, exit reflects failure', () => {
+  const { base, skill, e } = fixture();
+  const st = stubs(base);
+  const home = path.join(base, 'oc'); mkdirSync(path.join(home, 'skills'), { recursive: true });
+  symlinkSync(skill, path.join(home, 'skills/chrome-devtools'));
+  writeFileSync(path.join(home, 'opencode.json'), '// jsonc\n{"mcp":{}}');
+  const r = run('install-opencode.sh', [], { ...e, OPENCODE_HOME: home, PATH: st.PATH });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /left unchanged/);
+  assert.throws(() => lstatSync(path.join(home, 'skills/chrome-devtools')), 'skill link removed before the config step');
+  assert.equal(readFileSync(path.join(home, 'opencode.json'), 'utf8'), '// jsonc\n{"mcp":{}}');
+  assert.deepEqual(execFileSync('ls', ['-A', home], { encoding: 'utf8' }).trim().split('\n').sort(), ['opencode.json', 'skills']);
+  // a string-typed command is neither ours nor a crash
+  const cfg = { mcp: { 'chrome-devtools': { type: 'local', command: '/bin/other' } } };
+  writeFileSync(path.join(home, 'opencode.json'), JSON.stringify(cfg));
+  assert.equal(run('install-opencode.sh', [], { ...e, OPENCODE_HOME: home, PATH: st.PATH }).status, 0);
+  assert.deepEqual(readJson(path.join(home, 'opencode.json')), cfg);
   rmSync(base, { recursive: true, force: true });
 });
 

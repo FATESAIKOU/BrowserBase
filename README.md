@@ -59,8 +59,10 @@ only the items listed here; everything else in your configs is left as it was:
   `~/.claude/skills/chrome-devtools` if it is a symlink to this repo's vendored skill.
 - OpenCode: `mcp["chrome-devtools"]` in the global `opencode.json` if it points at the wrapper, and
   `skills/chrome-devtools` if it is a symlink to the vendored skill. Also removed, because older
-  versions' cleanup did the same: `mcp["cdp-enh"]`, `permission["cdp_*"]` and `permission.bash`
-  rules ending in `start_browser.sh`. `update`, all other permissions, other MCP servers and
+  versions of this installer wrote them under names of their own, so these names are deleted:
+  `mcp["cdp-enh"]`, `permission["cdp_*"]` and `permission.bash` rules ending in
+  `start_browser.sh`. If the config is not plain JSON (e.g. JSONC), the installer warns, leaves it
+  unchanged and exits non-zero, after having removed the skill link. `update`, all other permissions, other MCP servers and
   `$schema` are untouched. **Not removed:** the `permission.external_directory[<this repo>]` entry
   older versions added; it cannot be told apart from a user's own rule and may be what lets an
   agent read the linked skill, so it stays.
@@ -68,8 +70,8 @@ only the items listed here; everything else in your configs is left as it was:
 ## Start a browser session (Claude Code)
 
 ```bash
-scripts/browser-claude.sh            # same as `claude`, plus the chrome-devtools MCP
-scripts/browser-claude.sh -p "…"     # any claude arguments are passed through
+scripts/browser-claude.sh            # a `claude` session (interactive) plus the chrome-devtools MCP
+scripts/browser-claude.sh -p "…"     # session options/prompt are passed through to claude
 ```
 
 It runs `exec claude "$@" --mcp-config '<json>'` (before a literal `--` if you pass one), where
@@ -78,8 +80,8 @@ the JSON points at
 hard-coded). Chrome is still started by the wrapper, never by Puppeteer.
 
 The flag goes last because `--mcp-config` takes a space-separated list (`<configs...>`): placed
-before a bare prompt it would swallow the prompt as another config. This is a session launcher; it
-is not meant for `claude` subcommands. (Not verified against the real parser, only against a stub
+before a bare prompt it would swallow the prompt as another config. This is a session launcher: subcommands
+(`doctor`, `mcp`, `update`, …) must not go through this script; run `claude` directly for them. (Not verified against the real parser, only against a stub
 that records the arguments.)
 
 `--mcp-config` alone **adds** the server to the session's existing MCP servers. We deliberately do
@@ -111,31 +113,36 @@ makes it start the server only for sessions in that directory and stop it afterw
    skill path; the docs do not say whether symlinks are followed).
 3. Runs `opencode <dir>` (override the command with `OPENCODE_BIN`).
 
-**Keeping it out of git.** In a git repo or worktree the script appends these lines to the
-repo's `info/exclude` (resolved with `git rev-parse --git-path`, so worktrees work), skipping lines
+**Keeping it out of git.** In a git repo or worktree the script appends these lines to the repo's
+`info/exclude` (resolved with `git rev-parse --git-path`, so worktrees work), skipping lines
 already present: `/<dir>/opencode.json`, `/<dir>/.opencode/skills/chrome-devtools` and its own state
-file `.opencode/.browserbase-state`, with the path anchored from the worktree root and
-`[ ] \ * ?` escaped. If `opencode.json` is already **tracked**, it stops with an error instead of
-editing it. Outside a git repo it only prints a reminder.
-
-`info/exclude` is shared by all worktrees of a repo, which has two consequences:
-- A root-level rule would also hide another worktree's *own* untracked `opencode.json`. The script
-  refuses (before writing anything) if another worktree has such a file; use a subdirectory or
-  a different location instead.
-- `--remove` leaves the exclude lines in place while another worktree still has our state file,
-  and hands them over to it; the last worktree to run `--remove` removes them.
+file `.opencode/.browserbase-state`, anchored from the worktree root with `[ ] \ * ?` escaped.
+If `opencode.json` is already **tracked**, it stops with an error instead of editing it. Outside a
+git repo it only prints a reminder.
 
 `--remove` removes the mcp key (only if it is ours), the skill link (only if it is our symlink) and
-the exclude lines it added, and deletes `opencode.json` only if the script created it and nothing
-but our (empty) `mcp` is left in it.
+the state file. It deletes `opencode.json` only if the script created it and it is empty again, and
+it drops a leftover empty `"mcp": {}`. **It never edits `info/exclude`:** the lines stay in the
+repo's `.git/info/exclude` (shared by all its worktrees). They are harmless but have one known
+side effect: an untracked `opencode.json` or `.opencode/skills/chrome-devtools` of your own at the
+same path in that repo, also in other worktrees, is hidden from `git status` as well. To drop the
+lines by hand:
+
+```bash
+f="$(git rev-parse --git-path info/exclude)"
+grep -vE '/(opencode\.json|\.opencode/(skills/chrome-devtools|\.browserbase-state))$' "$f" > "$f.new" && mv "$f.new" "$f"
+```
 
 Tests: `node --test test/browser-opencode.test.mjs`. They run in throw-away temp dirs with a stub
 `claude` and `npm` first on `PATH` and `OPENCODE_BIN=true`; no opencode, claude or Chrome is
 started. The install scripts the tests run do create `user_profile/` and chmod the wrapper inside
-this repo (`update_vendor`). Covered: config merge/removal, foreign entries/links left alone,
-plain dir, git repo, worktree, worktree subdirectory, shared-exclude handling between worktrees,
-special characters in paths, tracked-file refusal, `install-opencode.sh` and `install-claude.sh`
-against synthetic configs, and `browser-claude.sh` argument order.
+this repo (`update_vendor`). Covered: config merge/removal and restoring file mode; foreign
+entries and links left alone; plain dir, git repo, worktree and worktree subdirectory (`git status`
+clean, exclude lines kept by `--remove`, README cleanup command); other worktrees staying clean
+after `--remove`; the same-path side effect above; special characters in paths; tracked-file
+refusal; a user's own `opencode.json.tmp` never deleted; `install-opencode.sh` (leftover cleanup,
+string/JSONC configs, foreign items) and `install-claude.sh` against synthetic configs; and
+`browser-claude.sh` argument order.
 Not verified: that a real OpenCode picks up the project MCP/skill (including through the symlink),
 that a shared OpenCode service stops the server afterwards, and the real `claude` argument parser.
 
