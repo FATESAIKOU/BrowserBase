@@ -45,18 +45,22 @@ restarts, and the window is always visible.
 ## Install
 
 ```bash
-bash scripts/install-claude.sh      # Claude Code: vendors the server + skill, removes any old global MCP entry
-bash scripts/install-opencode.sh    # OpenCode     (~/.config/opencode)
+bash scripts/install-claude.sh      # vendors the server; removes old global Claude Code entries
+bash scripts/install-opencode.sh    # vendors the server; removes old global OpenCode entries
 ```
 
-`install-claude.sh` (idempotent; re-run to update):
-1. `npm install chrome-devtools-mcp@latest` into `.mcp/`.
-2. Removes a `chrome-devtools` MCP entry that points at the wrapper (written by older versions);
-   other MCP servers are left alone.
-3. Symlinks the package's official `chrome-devtools` skill into `~/.claude/skills`.
+Both are idempotent (re-run to update the vendored server). Neither registers anything globally:
+the server's 29 tool definitions and the skill description would otherwise sit in the context of
+every session, including the many that never open a browser. Browser sessions opt in with the
+launchers below. The installers also remove what older versions wrote globally, and only that:
 
-It does **not** register the MCP server globally. The server's 29 tool definitions would take up
-context in every Claude Code session, including the many that never open a browser.
+- Claude Code: the user-scope `chrome-devtools` MCP entry if it points at this repo's wrapper, and
+  `~/.claude/skills/chrome-devtools` if it is a symlink to this repo's vendored skill.
+- OpenCode: `mcp["chrome-devtools"]` in the global `opencode.json` if it points at the wrapper, and
+  `skills/chrome-devtools` if it is a symlink to the vendored skill. Permissions, `update`, other
+  MCP servers and every other key are left exactly as they were. (Older versions also added a
+  `permission.external_directory` entry for this repo; it is indistinguishable from a user's own
+  rule, so it is left alone.)
 
 ## Start a browser session (Claude Code)
 
@@ -73,14 +77,45 @@ hard-coded). Chrome is still started by the wrapper, never by Puppeteer.
 not pass `--strict-mcp-config`, which would ignore every other MCP server (global, project
 `.mcp.json`, claude.ai connectors) and leave only this one.
 
-Skill note: the `chrome-devtools` skill is still linked globally, so its short description is in
-every session's context even though it is useless without the MCP tools. Remove
-`~/.claude/skills/chrome-devtools` if you want zero footprint outside browser sessions.
+**Skill: not delivered per session.** Claude Code has `--plugin-dir` (a folder with
+`.claude-plugin/plugin.json` and `skills/<name>/SKILL.md` loaded for one session, skills namespaced
+as `plugin:skill`), which could carry the skill. It is not wired in because it has not been
+verified end to end here (in particular whether a symlinked vendored skill is followed), and
+`--add-dir` only widens file access. Without it, the MCP tool descriptions are usually enough; for
+extra guidance use `scripts/browser-claude.sh --append-system-prompt "…"` or load the vendored
+`SKILL.md` into the prompt yourself.
 
-Verified: `browser-claude.sh -p` showed the server connected (source `dynamic`) with 29
-`mcp__chrome-devtools__*` tools while the other server (claude.ai connector) stayed available; on a
-config without the old global entry, `claude mcp list` shows no `chrome-devtools`. Not verified:
-interactive (non-`-p`) sessions, and a project-level `.mcp.json` alternative.
+## Start a browser session (OpenCode)
+
+```bash
+scripts/browser-opencode.sh [dir]            # dir defaults to the current directory
+scripts/browser-opencode.sh --remove [dir]   # undo
+```
+
+OpenCode's MCP servers are started by a shared background service. A project-level `opencode.json`
+makes it start the server only for sessions in that directory and stop it afterwards. The script:
+
+1. Merges **only** `mcp["chrome-devtools"]` (local, command = this repo's wrapper, timeout 60000)
+   into `<dir>/opencode.json` with `jq`; every other key is kept. A *different* existing
+   `chrome-devtools` entry is never overwritten.
+2. Symlinks the vendored skill to `<dir>/.opencode/skills/chrome-devtools` (OpenCode's project
+   skill path; the docs do not say whether symlinks are followed).
+3. Runs `opencode <dir>` (override the command with `OPENCODE_BIN`).
+
+**Never committed:** in a git repo or worktree, the script appends the two paths (and its own state
+file `.opencode/.browserbase-state`) to the repo's `info/exclude` (resolved with
+`git rev-parse --git-path`, so worktrees work), skipping lines already present. If `opencode.json`
+is already **tracked** it stops with an error instead of editing it. `--remove` deletes the mcp key
+and the skill link, removes only the exclude lines it added, and deletes `opencode.json` only if the
+script created it and it is empty again. Outside a git repo it prints a reminder to keep these
+files out of any repo. Caveat: `info/exclude` is shared by all worktrees of a repo, so `--remove`
+in one worktree also drops the exclude lines the others rely on until they run the script again.
+
+Tests: `node --test test/browser-opencode.test.mjs` (temp dirs only; no opencode/Chrome started).
+Verified: config merge/removal, plain dir, git repo, worktree and worktree subdirectory (`git status`
+clean, exclude restored), tracked-file refusal, and both installers against copies of real configs.
+Not verified: that a real OpenCode picks up the project MCP/skill (including through the symlink),
+or that a shared OpenCode service stops the server afterwards.
 
 ## Use
 
@@ -120,8 +155,9 @@ The wrapper reads these env vars (all optional):
 ```
 scripts/chrome-devtools-wrapper.sh   launches stock Chrome + attaches the official MCP server
 scripts/browser-claude.sh            starts Claude Code with the browser MCP attached (per session)
-scripts/install-claude.sh            vendors server + skill, removes old global MCP entry
-scripts/install-opencode.sh          vendors + registers for OpenCode
+scripts/browser-opencode.sh          adds the browser MCP + skill to one project dir for OpenCode
+scripts/install-claude.sh            vendors the server, removes old global Claude Code entries
+scripts/install-opencode.sh          vendors the server, removes old global OpenCode entries
 scripts/_vendor.sh                   shared: npm install .mcp/ + skill symlink helpers
 .mcp/                                vendored chrome-devtools-mcp (server + skills, gitignored)
 user_profile/                        persistent Chrome profile (gitignored)
