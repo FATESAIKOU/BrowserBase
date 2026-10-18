@@ -10,7 +10,7 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_vendor.sh"
 
 OPENCODE_HOME="${OPENCODE_HOME:-$HOME/.config/opencode}"
-CONFIG="${OPENCODE_HOME}/opencode.json"
+CONFIG="$(resolve_link "${OPENCODE_HOME}/opencode.json")"   # real file if it is a symlink
 
 command -v jq >/dev/null 2>&1 || { echo "[ERROR] jq not found"; exit 1; }
 
@@ -28,18 +28,18 @@ RC=0
 if [ -f "$CONFIG" ]; then
   TMP="$(mktemp "${CONFIG}.XXXXXX")"
   trap 'rm -f "$TMP"' EXIT
-  if jq --arg w "$WRAPPER" '
+  if ERR="$(jq --arg w "$WRAPPER" '
     (if (.permission | type) == "object" then .permission |= del(.["cdp_*"]) else . end)
     | (if (.permission.bash | type) == "object" then .permission.bash |= with_entries(select(.key | endswith("start_browser.sh") | not)) else . end)
     | (if (.mcp | type) == "object" then .mcp |= (del(.["cdp-enh"])
         | if ((.["chrome-devtools"].command? | if type == "array" then .[0] else . end) == $w) then del(.["chrome-devtools"]) else . end) else . end)
-  ' "$CONFIG" > "$TMP" 2>/dev/null; then
+  ' "$CONFIG" 2>&1 >"$TMP")"; then
     if [ "$(jq -S . "$CONFIG")" != "$(jq -S . "$TMP")" ]; then
       chmod "$(stat -f %Lp "$CONFIG" 2>/dev/null || stat -c %a "$CONFIG")" "$TMP"
       mv "$TMP" "$CONFIG"; echo "[mcp] removed old OpenCode leftovers from ${CONFIG}"
     fi
   else
-    echo "[WARN] could not clean ${CONFIG} (not plain JSON, or unexpected shape); left unchanged." >&2
+    echo "[WARN] could not clean ${CONFIG} (not plain JSON, or unexpected shape); left unchanged. jq said: $(printf '%s' "$ERR" | head -n1)" >&2
     RC=1
   fi
 fi

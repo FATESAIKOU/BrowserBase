@@ -121,22 +121,31 @@ If `opencode.json` is already **tracked**, it stops with an error instead of edi
 git repo it only prints a reminder.
 
 `--remove` removes the mcp key (only if it is ours), the skill link (only if it is our symlink) and
-the state file. It deletes `opencode.json` only if the script created it and it is empty again, and
-it drops a leftover empty `"mcp": {}`. **It never edits `info/exclude`:** the lines stay in the
-repo's `.git/info/exclude` (shared by all its worktrees). They are harmless but have one known
-side effect: an untracked `opencode.json` or `.opencode/skills/chrome-devtools` of your own at the
-same path in that repo, also in other worktrees, is hidden from `git status` as well. To drop the
-lines by hand:
+the state file. It deletes `opencode.json` only if the script created it and it is empty again. It
+drops an empty `"mcp": {}` only when the state file says the script introduced the `mcp` key; if
+there is no state (e.g. the file was never touched by the script) your own `{"mcp": {}}` is left
+alone. A symlinked `opencode.json` (e.g. into a dotfiles repo) stays a symlink: the real file it
+points to is updated, keeping its mode.
+
+**It never edits `info/exclude`, so the lines stay in the repo's `.git/info/exclude`** (shared by all
+its worktrees). That is not free: from then on `git status` silently hides any untracked
+`opencode.json` or `.opencode/skills/chrome-devtools` of your own at the same path in that repo,
+including in other worktrees, and `git add opencode.json` is refused ("ignored by .gitignore")
+until you remove the lines. To drop exactly the three lines the script adds at the worktree root
+(exact whole-line matches, nothing else is touched; for a subdirectory use the same lines prefixed
+with `/<subdir>`, with `[ ] \ * ?` backslash-escaped):
 
 ```bash
 f="$(git rev-parse --git-path info/exclude)"
-grep -vE '/(opencode\.json|\.opencode/(skills/chrome-devtools|\.browserbase-state))$' "$f" > "$f.new" && mv "$f.new" "$f"
+for l in /opencode.json /.opencode/skills/chrome-devtools /.opencode/.browserbase-state; do
+  grep -vxF -- "$l" "$f" > "$f.new" || true; mv "$f.new" "$f"
+done
 ```
 
 Tests: `node --test test/browser-opencode.test.mjs`. They run in throw-away temp dirs with a stub
 `claude` and `npm` first on `PATH` and `OPENCODE_BIN=true`; no opencode, claude or Chrome is
 started. The install scripts the tests run do create `user_profile/` and chmod the wrapper inside
-this repo (`update_vendor`). Covered: config merge/removal and restoring file mode; foreign
+this repo (`update_vendor`). Covered: config merge/removal and restoring file mode; symlinked configs (absolute and relative links) for both scripts; the cleanup snippet above leaving a user's `/sub/opencode.json`; foreign
 entries and links left alone; plain dir, git repo, worktree and worktree subdirectory (`git status`
 clean, exclude lines kept by `--remove`, README cleanup command); other worktrees staying clean
 after `--remove`; the same-path side effect above; special characters in paths; tracked-file

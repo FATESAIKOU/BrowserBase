@@ -88,7 +88,9 @@ test('refuses to overwrite a foreign mcp.chrome-devtools', () => {
   rmSync(base, { recursive: true });
 });
 
-const CLEANUP = String.raw`grep -vE '/(opencode\.json|\.opencode/(skills/chrome-devtools|\.browserbase-state))$' "$f" > "$f.new" && mv "$f.new" "$f"`;
+// The manual cleanup snippet is taken from the README so the documented command is what gets tested.
+const readme = readFileSync(path.join(root, 'README.md'), 'utf8');
+const CLEANUP = readme.match(/```bash\n(f="\$\(git rev-parse --git-path info\/exclude\)"[\s\S]*?)```/)[1];
 for (const kind of ['repo', 'worktree', 'subdir of worktree']) {
   test(`git ${kind}: status clean; --remove keeps exclude lines; README cleanup command restores`, () => {
     const { base, e } = fixture();
@@ -112,8 +114,10 @@ for (const kind of ['repo', 'worktree', 'subdir of worktree']) {
     assert.equal(git(d, 'status', '--porcelain', '-uall'), '');
 
     // the manual cleanup command from the README restores the file
-    execFileSync('bash', ['-c', CLEANUP], { env: { ...process.env, f: excludeFile } });
-    assert.equal(readFileSync(excludeFile, 'utf8'), before);
+    if (kind !== 'subdir of worktree') {   // the README snippet is for the worktree-root lines
+      execFileSync('bash', ['-c', CLEANUP], { cwd: d });
+      assert.equal(readFileSync(excludeFile, 'utf8'), before);
+    }
     rmSync(base, { recursive: true, force: true });
   });
 }
@@ -329,13 +333,13 @@ test('user\'s own opencode.json.tmp is never deleted (add, --remove, install-ope
   rmSync(base, { recursive: true, force: true });
 });
 
-test('--remove: leftover {"mcp":{}} loses the empty key; file deleted only if we created it', () => {
+test('--remove: empty mcp only dropped when state says we introduced it; file deleted only if we created it', () => {
   const { base, e } = fixture();
-  // not created by us: {"mcp":{}} -> {} (file kept)
+  // not ours (no state): the user's own {"mcp":{}} is left exactly as it is
   const d1 = path.join(base, 'p1'); mkdirSync(d1);
   writeFileSync(path.join(d1, 'opencode.json'), '{"mcp":{}}');
   assert.equal(run('browser-opencode.sh', ['--remove', d1], e).status, 0);
-  assert.deepEqual(readJson(path.join(d1, 'opencode.json')), {});
+  assert.equal(readFileSync(path.join(d1, 'opencode.json'), 'utf8'), '{"mcp":{}}');
   // created by us: deleted
   const d2 = path.join(base, 'p2'); mkdirSync(d2);
   run('browser-opencode.sh', [d2], e);
@@ -357,7 +361,7 @@ test('install-opencode.sh: unparsable config or string command -> skill link sti
   writeFileSync(path.join(home, 'opencode.json'), '// jsonc\n{"mcp":{}}');
   const r = run('install-opencode.sh', [], { ...e, OPENCODE_HOME: home, PATH: st.PATH });
   assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /left unchanged/);
+  assert.match(r.stderr, /left unchanged\. jq said: jq: parse error/);
   assert.throws(() => lstatSync(path.join(home, 'skills/chrome-devtools')), 'skill link removed before the config step');
   assert.equal(readFileSync(path.join(home, 'opencode.json'), 'utf8'), '// jsonc\n{"mcp":{}}');
   assert.deepEqual(execFileSync('ls', ['-A', home], { encoding: 'utf8' }).trim().split('\n').sort(), ['opencode.json', 'skills']);
@@ -381,5 +385,53 @@ test('exclude lines escape gitignore specials ([ ] \\) and stay anchored', () =>
   assert.doesNotMatch(st, /a\[b\]/, 'our files in the odd dir are hidden');
   assert.equal(run('browser-opencode.sh', ['--remove', odd], e).status, 0);
   assert.doesNotMatch(git(d, 'status', '--porcelain', '-uall'), /a\[b\]/);
+  rmSync(base, { recursive: true, force: true });
+});
+
+test('user\'s own exclude lines (e.g. /sub/opencode.json) survive the README cleanup snippet', () => {
+  const { base, e } = fixture();
+  const d = repo(base, 'main');
+  const ex = path.join(d, '.git/info/exclude');
+  const mine = '/sub/opencode.json\n/opencode.json.bak\n';
+  writeFileSync(ex, mine);
+  run('browser-opencode.sh', [d], e);
+  execFileSync('bash', ['-c', CLEANUP], { cwd: d });
+  assert.equal(readFileSync(ex, 'utf8'), mine);
+  rmSync(base, { recursive: true, force: true });
+});
+
+test('symlinked config (dotfiles): add / --remove / install keep the symlink, update the target, keep its mode', () => {
+  const { base, e } = fixture();
+  const dot = path.join(base, 'dotfiles'); mkdirSync(dot);
+  const real = path.join(dot, 'opencode.json');
+  const orig = { update: 'disable', mcp: { other: { type: 'remote', url: 'http://127.0.0.1:1/x' } } };
+  const isLink = (f) => lstatSync(f).isSymbolicLink();
+  const mode = (f) => lstatSync(f).mode & 0o777;
+
+  for (const target of [real, path.relative(path.join(base, 'proj'), real)]) {   // absolute and relative link
+    const d = path.join(base, 'proj'); mkdirSync(d, { recursive: true });
+    writeFileSync(real, JSON.stringify(orig)); chmodSync(real, 0o640);
+    symlinkSync(target, path.join(d, 'opencode.json'));
+    assert.equal(run('browser-opencode.sh', [d], e).status, 0);
+    assert.ok(isLink(path.join(d, 'opencode.json')), 'still a symlink after add');
+    assert.equal(readlinkSync(path.join(d, 'opencode.json')), target);
+    assert.deepEqual(readJson(real), { ...orig, mcp: { ...orig.mcp, 'chrome-devtools': ours } });
+    assert.equal(mode(real), 0o640);
+    assert.equal(run('browser-opencode.sh', ['--remove', d], e).status, 0);
+    assert.ok(isLink(path.join(d, 'opencode.json')), 'still a symlink after --remove');
+    assert.deepEqual(readJson(real), orig);
+    assert.equal(mode(real), 0o640);
+    assert.deepEqual(execFileSync('ls', ['-A', dot], { encoding: 'utf8' }).trim().split('\n'), ['opencode.json'], 'no stray temp files');
+    rmSync(d, { recursive: true });
+  }
+
+  const st = stubs(base);
+  const home = path.join(base, 'oc'); mkdirSync(home);
+  writeFileSync(real, JSON.stringify({ ...orig, mcp: { 'cdp-enh': {}, ...orig.mcp } })); chmodSync(real, 0o640);
+  symlinkSync(real, path.join(home, 'opencode.json'));
+  assert.equal(run('install-opencode.sh', [], { ...e, OPENCODE_HOME: home, PATH: st.PATH }).status, 0);
+  assert.ok(isLink(path.join(home, 'opencode.json')));
+  assert.deepEqual(readJson(real), orig);
+  assert.equal(mode(real), 0o640);
   rmSync(base, { recursive: true, force: true });
 });

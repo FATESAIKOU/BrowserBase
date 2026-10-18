@@ -21,7 +21,7 @@ done
 DIR="$(cd "${DIR:-$PWD}" && pwd)"
 command -v jq >/dev/null 2>&1 || { echo "[ERROR] jq not found" >&2; exit 1; }
 
-CONFIG="$DIR/opencode.json"
+CONFIG="$(resolve_link "$DIR/opencode.json")"   # real file if opencode.json is a symlink
 SKILLS="$DIR/.opencode/skills"
 LINK="$SKILLS/chrome-devtools"
 STATE="$DIR/.opencode/.browserbase-state"   # records only what WE created (created-config / created-mcp)
@@ -95,8 +95,8 @@ if [ -f "$CONFIG" ]; then
     write_json 'del(.mcp["chrome-devtools"])'
     echo "[mcp] removed chrome-devtools from $CONFIG"
   fi
-  # an empty mcp object we (or an older install) left behind
-  if jq -e '. == {"mcp": {}}' "$CONFIG" >/dev/null 2>&1 || { state_has created-mcp && jq -e '.mcp == {}' "$CONFIG" >/dev/null 2>&1; }; then
+  # an empty mcp object, only when our state says WE introduced the mcp key (otherwise it may be the user's)
+  if state_has created-mcp && jq -e '.mcp == {}' "$CONFIG" >/dev/null 2>&1; then
     write_json 'del(.mcp)'
   fi
   if state_has created-config && jq -e '. == {}' "$CONFIG" >/dev/null 2>&1; then rm "$CONFIG"; fi
